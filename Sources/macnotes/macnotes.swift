@@ -22,95 +22,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 struct Note: Identifiable, Codable, Equatable {
     let id: UUID
-    var title: String
     var body: String
     let createdAt: Date
     var updatedAt: Date
 
     init(
         id: UUID = UUID(),
-        title: String = "",
         body: String = "",
         createdAt: Date = Date(),
         updatedAt: Date = Date()
     ) {
         self.id = id
-        self.title = title
         self.body = body
         self.createdAt = createdAt
         self.updatedAt = updatedAt
     }
+
+    var titleLine: String {
+        let first = body.components(separatedBy: .newlines).first ?? ""
+        return first.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
 }
 
 private enum NoteFileCodec {
-    private static let separator = "\n---\n"
-
     static func encode(note: Note) -> String {
-        let titleLine = "title:\(note.title.replacingOccurrences(of: "\n", with: " "))"
-        let createdLine = "createdAt:\(formatDate(note.createdAt))"
-        let updatedLine = "updatedAt:\(formatDate(note.updatedAt))"
-        return [titleLine, createdLine, updatedLine].joined(separator: "\n") + separator + note.body
+        note.body
     }
 
-    static func decode(
-        id: UUID,
-        text: String,
-        fallbackCreatedAt: Date,
-        fallbackUpdatedAt: Date
-    ) -> Note {
+    static func decodeBody(text: String) -> String {
+        let separator = "\n---\n"
         let chunks = text.components(separatedBy: separator)
-        guard chunks.count >= 2 else {
-            return Note(
-                id: id,
-                title: "",
-                body: text,
-                createdAt: fallbackCreatedAt,
-                updatedAt: fallbackUpdatedAt
-            )
+        guard chunks.count >= 2 else { return text }
+
+        let headerLines = chunks[0].split(separator: "\n")
+        let isLegacyHeader = headerLines.contains(where: { $0.hasPrefix("title:") }) ||
+            headerLines.contains(where: { $0.hasPrefix("createdAt:") }) ||
+            headerLines.contains(where: { $0.hasPrefix("updatedAt:") })
+
+        if isLegacyHeader {
+            return chunks.dropFirst().joined(separator: separator)
         }
-
-        let metadata = chunks[0].split(separator: "\n")
-        let body = chunks.dropFirst().joined(separator: separator)
-        var title = ""
-        var createdAt = fallbackCreatedAt
-        var updatedAt = fallbackUpdatedAt
-
-        for line in metadata {
-            if line.hasPrefix("title:") {
-                title = String(line.dropFirst("title:".count))
-            } else if line.hasPrefix("createdAt:") {
-                let rawDate = String(line.dropFirst("createdAt:".count))
-                createdAt = parseDate(rawDate) ?? createdAt
-            } else if line.hasPrefix("updatedAt:") {
-                let rawDate = String(line.dropFirst("updatedAt:".count))
-                updatedAt = parseDate(rawDate) ?? updatedAt
-            }
-        }
-
-        return Note(
-            id: id,
-            title: title,
-            body: body,
-            createdAt: createdAt,
-            updatedAt: updatedAt
-        )
-    }
-
-    private static func parseDate(_ rawDate: String) -> Date? {
-        makeFormatter(fractionalSeconds: true).date(from: rawDate) ??
-            makeFormatter(fractionalSeconds: false).date(from: rawDate)
-    }
-
-    private static func formatDate(_ date: Date) -> String {
-        makeFormatter(fractionalSeconds: true).string(from: date)
-    }
-
-    private static func makeFormatter(fractionalSeconds: Bool) -> ISO8601DateFormatter {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = fractionalSeconds
-            ? [.withInternetDateTime, .withFractionalSeconds]
-            : [.withInternetDateTime]
-        return formatter
+        return text
     }
 }
 
@@ -129,7 +81,6 @@ final class NotesStore: ObservableObject {
 
         if notes.isEmpty {
             let starter = Note(
-                title: "",
                 body: "Start writing quick notes from your menu bar."
             )
             notes = [starter]
@@ -146,7 +97,7 @@ final class NotesStore: ObservableObject {
     }
 
     func addNote() {
-        let note = Note(title: "")
+        let note = Note(body: "")
         notes.insert(note, at: 0)
         selectedNoteID = note.id
         scheduleSave()
@@ -161,13 +112,12 @@ final class NotesStore: ObservableObject {
         scheduleSave()
     }
 
-    func updateNote(id: Note.ID, title: String, body: String) {
+    func updateNote(id: Note.ID, body: String) {
         guard let index = notes.firstIndex(where: { $0.id == id }) else { return }
         let existing = notes[index]
 
-        guard existing.title != title || existing.body != body else { return }
+        guard existing.body != body else { return }
 
-        notes[index].title = title
         notes[index].body = body
         notes[index].updatedAt = Date()
         scheduleSave()
@@ -178,7 +128,7 @@ final class NotesStore: ObservableObject {
         let filtered = trimmed.isEmpty
             ? notes
             : notes.filter { note in
-                note.title.localizedCaseInsensitiveContains(trimmed) ||
+                note.titleLine.localizedCaseInsensitiveContains(trimmed) ||
                 note.body.localizedCaseInsensitiveContains(trimmed)
             }
         return filtered.sorted(by: { $0.updatedAt > $1.updatedAt })
@@ -239,11 +189,11 @@ final class NotesStore: ObservableObject {
                 let createdAt = values?.creationDate ?? Date()
                 let updatedAt = values?.contentModificationDate ?? createdAt
                 let text = try String(contentsOf: fileURL, encoding: .utf8)
-                let note = NoteFileCodec.decode(
+                let note = Note(
                     id: id,
-                    text: text,
-                    fallbackCreatedAt: createdAt,
-                    fallbackUpdatedAt: updatedAt
+                    body: NoteFileCodec.decodeBody(text: text),
+                    createdAt: createdAt,
+                    updatedAt: updatedAt
                 )
                 loaded.append(note)
             }
@@ -273,9 +223,33 @@ final class NotesStore: ObservableObject {
 struct NotesRootView: View {
     @ObservedObject var store: NotesStore
     @State private var query = ""
+    @State private var pendingDeleteNoteID: Note.ID?
+    private let sidebarWidth: CGFloat = 320
+
+    private var isShowingDeleteAlert: Binding<Bool> {
+        Binding(
+            get: { pendingDeleteNoteID != nil },
+            set: { showing in
+                if !showing {
+                    pendingDeleteNoteID = nil
+                }
+            }
+        )
+    }
+
+    private var pendingDeleteNoteLabel: String {
+        guard
+            let pendingDeleteNoteID,
+            let note = store.notes.first(where: { $0.id == pendingDeleteNoteID })
+        else {
+            return "this note"
+        }
+        let title = note.titleLine
+        return title.isEmpty ? "this note" : "\"\(title)\""
+    }
 
     var body: some View {
-        NavigationSplitView {
+        HStack(spacing: 0) {
             VStack(spacing: 12) {
                 SidebarSearchBar(text: $query)
 
@@ -296,9 +270,10 @@ struct NotesRootView: View {
                     ForEach(store.sortedNotes(matching: query)) { note in
                         NoteRow(note: note)
                             .tag(note.id)
+                            .listRowBackground(Color.clear)
                             .contextMenu {
                                 Button(role: .destructive) {
-                                    store.deleteNote(id: note.id)
+                                    pendingDeleteNoteID = note.id
                                 } label: {
                                     Label("Delete Note", systemImage: "trash")
                                 }
@@ -306,28 +281,44 @@ struct NotesRootView: View {
                     }
                 }
                 .listStyle(.inset)
+                .scrollContentBackground(.hidden)
+                .background(Color.clear)
             }
+            .frame(width: sidebarWidth)
             .padding(14)
             .glassPanel()
-            .navigationSplitViewColumnWidth(min: 300, ideal: 320)
             .padding([.leading, .bottom, .top], 12)
-        } detail: {
+
             Group {
                 if let note = store.selectedNote {
-                    NoteEditorView(note: note) { title, body in
-                        store.updateNote(id: note.id, title: title, body: body)
+                    NoteEditorView(note: note) { body in
+                        store.updateNote(id: note.id, body: body)
                     } onDelete: {
-                        store.deleteNote(id: note.id)
+                        pendingDeleteNoteID = note.id
                     }
                     .id(note.id)
                 } else {
                     EmptyStateView()
                 }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
             .padding([.trailing, .bottom, .top], 12)
         }
-        .frame(width: 760, height: 520)
+        .frame(width: 900, height: 560)
         .background(LiquidGlassBackground())
+        .alert("Delete note?", isPresented: isShowingDeleteAlert) {
+            Button("Delete", role: .destructive) {
+                if let pendingDeleteNoteID {
+                    store.deleteNote(id: pendingDeleteNoteID)
+                }
+                pendingDeleteNoteID = nil
+            }
+            Button("Cancel", role: .cancel) {
+                pendingDeleteNoteID = nil
+            }
+        } message: {
+            Text("Are you sure you want to delete \(pendingDeleteNoteLabel)? This action cannot be undone.")
+        }
     }
 }
 
@@ -357,10 +348,14 @@ struct SidebarSearchBar: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 12)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .background(
+            VisualEffectBlurView(material: .menu, blendingMode: .behindWindow)
+                .opacity(0.26)
+                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        )
         .overlay(
             RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .stroke(.white.opacity(0.34), lineWidth: 1)
+                .stroke(.white.opacity(0.18), lineWidth: 1)
         )
     }
 }
@@ -369,47 +364,75 @@ struct NoteRow: View {
     let note: Note
 
     var body: some View {
-        let trimmedTitle = note.title.trimmingCharacters(in: .whitespacesAndNewlines)
-        VStack(alignment: .leading, spacing: 4) {
-            if !trimmedTitle.isEmpty {
-                Text(trimmedTitle)
-                    .font(.headline)
-                    .lineLimit(1)
-            }
-            Text(note.body.isEmpty ? " " : note.body)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .lineLimit(2)
-            Text(note.updatedAt.formatted(date: .abbreviated, time: .shortened))
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-        }
-        .padding(.vertical, 4)
+        Text(note.titleLine.isEmpty ? "New Note" : note.titleLine)
+            .font(.headline)
+            .foregroundStyle(note.titleLine.isEmpty ? .secondary : .primary)
+            .lineLimit(1)
+            .padding(.vertical, 8)
     }
 }
 
 struct NoteEditorView: View {
     let note: Note
-    let onChange: (String, String) -> Void
+    let onChange: (String) -> Void
     let onDelete: () -> Void
 
-    @State private var title: String
     @State private var noteContent: String
+    @State private var hasSelection = false
+    @State private var boldTrigger = 0
+    @State private var underlineTrigger = 0
+    @State private var increaseFontTrigger = 0
+    @State private var decreaseFontTrigger = 0
 
-    init(note: Note, onChange: @escaping (String, String) -> Void, onDelete: @escaping () -> Void) {
+    init(note: Note, onChange: @escaping (String) -> Void, onDelete: @escaping () -> Void) {
         self.note = note
         self.onChange = onChange
         self.onDelete = onDelete
-        _title = State(initialValue: note.title)
         _noteContent = State(initialValue: note.body)
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Text("Note")
-                    .font(.title3.bold())
+                Text("Formatting")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
                 Spacer()
+                HStack(spacing: 10) {
+                    Button {
+                        boldTrigger += 1
+                    } label: {
+                        Image(systemName: "bold")
+                    }
+                    .help("Toggle bold on selected text")
+                    .disabled(!hasSelection)
+
+                    Button {
+                        underlineTrigger += 1
+                    } label: {
+                        Image(systemName: "underline")
+                    }
+                    .help("Toggle underline on selected text")
+                    .disabled(!hasSelection)
+
+                    Button {
+                        decreaseFontTrigger += 1
+                    } label: {
+                        Image(systemName: "textformat.size.smaller")
+                    }
+                    .help("Decrease font size on selected text")
+                    .disabled(!hasSelection)
+
+                    Button {
+                        increaseFontTrigger += 1
+                    } label: {
+                        Image(systemName: "textformat.size.larger")
+                    }
+                    .help("Increase font size on selected text")
+                    .disabled(!hasSelection)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.large)
                 Button(role: .destructive) {
                     onDelete()
                 } label: {
@@ -417,22 +440,31 @@ struct NoteEditorView: View {
                 }
             }
 
-            TextField("Title (optional)", text: $title)
-                .font(.title3.weight(.semibold))
-                .textFieldStyle(.plain)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 8)
-                .background(.white.opacity(0.18), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            Text("The first line of your note is used as the title.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
 
-            TextEditor(text: $noteContent)
-                .font(.body)
-                .scrollContentBackground(.hidden)
-                .padding(8)
-                .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .stroke(.white.opacity(0.2), lineWidth: 1)
-                )
+            Text(hasSelection ? "Formatting applies to selected text." : "Select text to apply bold, underline, or font-size changes.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+
+            RichTextEditor(
+                text: $noteContent,
+                hasSelection: $hasSelection,
+                boldTrigger: boldTrigger,
+                underlineTrigger: underlineTrigger,
+                increaseFontTrigger: increaseFontTrigger,
+                decreaseFontTrigger: decreaseFontTrigger
+            )
+            .background(
+                VisualEffectBlurView(material: .menu, blendingMode: .behindWindow)
+                    .opacity(0.20)
+                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .stroke(.white.opacity(0.10), lineWidth: 1)
+            )
 
             HStack {
                 Text("Created \(note.createdAt.formatted(date: .abbreviated, time: .shortened))")
@@ -444,11 +476,201 @@ struct NoteEditorView: View {
         }
         .padding(14)
         .glassPanel()
-        .onChange(of: title) { _ in
-            onChange(title, noteContent)
-        }
         .onChange(of: noteContent) { _ in
-            onChange(title, noteContent)
+            onChange(noteContent)
+        }
+    }
+}
+
+struct RichTextEditor: NSViewRepresentable {
+    @Binding var text: String
+    @Binding var hasSelection: Bool
+    let boldTrigger: Int
+    let underlineTrigger: Int
+    let increaseFontTrigger: Int
+    let decreaseFontTrigger: Int
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(parent: self)
+    }
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let textView = NSTextView(frame: .zero)
+        textView.delegate = context.coordinator
+        textView.isRichText = true
+        textView.drawsBackground = false
+        textView.allowsUndo = true
+        textView.isAutomaticQuoteSubstitutionEnabled = false
+        textView.isAutomaticDashSubstitutionEnabled = false
+        textView.isAutomaticDataDetectionEnabled = false
+        textView.isAutomaticTextReplacementEnabled = false
+        textView.textContainerInset = NSSize(width: 10, height: 12)
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.autoresizingMask = [.width]
+        textView.textContainer?.widthTracksTextView = true
+        textView.textContainer?.containerSize = NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude)
+        textView.string = text
+        let baseFont = NSFont.systemFont(ofSize: 16, weight: .regular)
+        textView.typingAttributes = [
+            .font: baseFont,
+            .foregroundColor: NSColor.labelColor
+        ]
+        textView.insertionPointColor = .labelColor
+
+        context.coordinator.textView = textView
+        context.coordinator.syncSelectionState()
+
+        let scrollView = NSScrollView()
+        scrollView.borderType = .noBorder
+        scrollView.drawsBackground = false
+        scrollView.hasVerticalScroller = true
+        scrollView.documentView = textView
+        return scrollView
+    }
+
+    func updateNSView(_ nsView: NSScrollView, context: Context) {
+        context.coordinator.parent = self
+        guard let textView = context.coordinator.textView else { return }
+        if textView.string != text {
+            textView.string = text
+        }
+        context.coordinator.syncSelectionState()
+        context.coordinator.handleTriggers(
+            boldTrigger: boldTrigger,
+            underlineTrigger: underlineTrigger,
+            increaseFontTrigger: increaseFontTrigger,
+            decreaseFontTrigger: decreaseFontTrigger
+        )
+    }
+
+    final class Coordinator: NSObject, NSTextViewDelegate {
+        var parent: RichTextEditor
+        weak var textView: NSTextView?
+        private var lastBoldTrigger = 0
+        private var lastUnderlineTrigger = 0
+        private var lastIncreaseFontTrigger = 0
+        private var lastDecreaseFontTrigger = 0
+
+        init(parent: RichTextEditor) {
+            self.parent = parent
+        }
+
+        func textDidChange(_ notification: Notification) {
+            guard let textView else { return }
+            if parent.text != textView.string {
+                parent.text = textView.string
+            }
+        }
+
+        func textViewDidChangeSelection(_ notification: Notification) {
+            syncSelectionState()
+        }
+
+        func syncSelectionState() {
+            guard let textView else { return }
+            let hasSelection = textView.selectedRange().length > 0
+            if parent.hasSelection != hasSelection {
+                parent.hasSelection = hasSelection
+            }
+        }
+
+        func handleTriggers(
+            boldTrigger: Int,
+            underlineTrigger: Int,
+            increaseFontTrigger: Int,
+            decreaseFontTrigger: Int
+        ) {
+            if boldTrigger != lastBoldTrigger {
+                lastBoldTrigger = boldTrigger
+                toggleBoldForSelection()
+            }
+
+            if underlineTrigger != lastUnderlineTrigger {
+                lastUnderlineTrigger = underlineTrigger
+                toggleUnderlineForSelection()
+            }
+
+            if increaseFontTrigger != lastIncreaseFontTrigger {
+                lastIncreaseFontTrigger = increaseFontTrigger
+                adjustFontSizeForSelection(delta: 1)
+            }
+
+            if decreaseFontTrigger != lastDecreaseFontTrigger {
+                lastDecreaseFontTrigger = decreaseFontTrigger
+                adjustFontSizeForSelection(delta: -1)
+            }
+        }
+
+        private func selectedRangeIfAny() -> NSRange? {
+            guard let textView else { return nil }
+            let selectedRange = textView.selectedRange()
+            return selectedRange.length > 0 ? selectedRange : nil
+        }
+
+        private func toggleBoldForSelection() {
+            guard
+                let textView,
+                let textStorage = textView.textStorage,
+                let selectedRange = selectedRangeIfAny()
+            else { return }
+
+            var allBold = true
+            textStorage.enumerateAttribute(.font, in: selectedRange, options: []) { value, _, _ in
+                let font = (value as? NSFont) ?? NSFont.systemFont(ofSize: 16)
+                if !NSFontManager.shared.traits(of: font).contains(.boldFontMask) {
+                    allBold = false
+                }
+            }
+
+            textStorage.beginEditing()
+            textStorage.enumerateAttribute(.font, in: selectedRange, options: []) { value, range, _ in
+                let currentFont = (value as? NSFont) ?? NSFont.systemFont(ofSize: 16)
+                let converted = allBold
+                    ? NSFontManager.shared.convert(currentFont, toNotHaveTrait: .boldFontMask)
+                    : NSFontManager.shared.convert(currentFont, toHaveTrait: .boldFontMask)
+                let resized = NSFontManager.shared.convert(converted, toSize: currentFont.pointSize)
+                textStorage.addAttribute(.font, value: resized, range: range)
+                textStorage.addAttribute(.foregroundColor, value: NSColor.labelColor, range: range)
+            }
+            textStorage.endEditing()
+        }
+
+        private func toggleUnderlineForSelection() {
+            guard
+                let textView,
+                let textStorage = textView.textStorage,
+                let selectedRange = selectedRangeIfAny()
+            else { return }
+
+            var allUnderlined = true
+            textStorage.enumerateAttribute(.underlineStyle, in: selectedRange, options: []) { value, _, _ in
+                let styleValue = (value as? NSNumber)?.intValue ?? (value as? Int) ?? 0
+                if styleValue == 0 {
+                    allUnderlined = false
+                }
+            }
+
+            let targetStyle = allUnderlined ? 0 : NSUnderlineStyle.single.rawValue
+            textStorage.addAttribute(.underlineStyle, value: targetStyle, range: selectedRange)
+        }
+
+        private func adjustFontSizeForSelection(delta: CGFloat) {
+            guard
+                let textView,
+                let textStorage = textView.textStorage,
+                let selectedRange = selectedRangeIfAny()
+            else { return }
+
+            textStorage.beginEditing()
+            textStorage.enumerateAttribute(.font, in: selectedRange, options: []) { value, range, _ in
+                let currentFont = (value as? NSFont) ?? NSFont.systemFont(ofSize: 16)
+                let nextSize = min(40, max(10, currentFont.pointSize + delta))
+                let resized = NSFontManager.shared.convert(currentFont, toSize: nextSize)
+                textStorage.addAttribute(.font, value: resized, range: range)
+                textStorage.addAttribute(.foregroundColor, value: NSColor.labelColor, range: range)
+            }
+            textStorage.endEditing()
         }
     }
 }
@@ -471,33 +693,51 @@ struct EmptyStateView: View {
     }
 }
 
+struct VisualEffectBlurView: NSViewRepresentable {
+    let material: NSVisualEffectView.Material
+    let blendingMode: NSVisualEffectView.BlendingMode
+
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let view = NSVisualEffectView()
+        view.state = .active
+        view.material = material
+        view.blendingMode = blendingMode
+        view.isEmphasized = false
+        return view
+    }
+
+    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {
+        nsView.material = material
+        nsView.blendingMode = blendingMode
+    }
+}
+
 struct LiquidGlassBackground: View {
     var body: some View {
         ZStack {
+            VisualEffectBlurView(material: .hudWindow, blendingMode: .behindWindow)
+                .opacity(0.32)
+
             LinearGradient(
                 colors: [
-                    Color(red: 0.06, green: 0.12, blue: 0.20),
-                    Color(red: 0.09, green: 0.20, blue: 0.31),
-                    Color(red: 0.15, green: 0.26, blue: 0.35)
+                    Color.white.opacity(0.08),
+                    Color.white.opacity(0.00)
                 ],
                 startPoint: .topLeading,
                 endPoint: .bottomTrailing
             )
 
             Circle()
-                .fill(Color(red: 0.45, green: 0.74, blue: 0.97).opacity(0.48))
-                .frame(width: 330, height: 330)
-                .blur(radius: 55)
-                .offset(x: -180, y: -160)
+                .fill(Color(red: 0.45, green: 0.74, blue: 0.97).opacity(0.08))
+                .frame(width: 420, height: 420)
+                .blur(radius: 75)
+                .offset(x: -210, y: -190)
 
             Circle()
-                .fill(Color(red: 0.56, green: 0.93, blue: 0.84).opacity(0.34))
-                .frame(width: 290, height: 290)
-                .blur(radius: 62)
-                .offset(x: 210, y: 190)
-
-            Rectangle()
-                .fill(.ultraThinMaterial.opacity(0.25))
+                .fill(Color(red: 0.56, green: 0.93, blue: 0.84).opacity(0.07))
+                .frame(width: 360, height: 360)
+                .blur(radius: 70)
+                .offset(x: 230, y: 210)
         }
     }
 }
@@ -505,18 +745,22 @@ struct LiquidGlassBackground: View {
 extension View {
     func glassPanel() -> some View {
         self
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .background(
+                VisualEffectBlurView(material: .hudWindow, blendingMode: .behindWindow)
+                    .opacity(0.24)
+                    .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+            )
             .overlay(
                 RoundedRectangle(cornerRadius: 16, style: .continuous)
                     .stroke(
                         LinearGradient(
-                            colors: [.white.opacity(0.55), .white.opacity(0.10)],
+                            colors: [.white.opacity(0.20), .white.opacity(0.02)],
                             startPoint: .topLeading,
                             endPoint: .bottomTrailing
                         ),
                         lineWidth: 1
                     )
             )
-            .shadow(color: .black.opacity(0.24), radius: 22, x: 0, y: 14)
+            .shadow(color: .black.opacity(0.04), radius: 6, x: 0, y: 3)
     }
 }
