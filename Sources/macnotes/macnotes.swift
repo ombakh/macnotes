@@ -22,6 +22,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 struct Note: Identifiable, Codable, Equatable {
     let id: UUID
+    var folder: String
     var body: String
     var richTextRTFBase64: String?
     let createdAt: Date
@@ -29,12 +30,14 @@ struct Note: Identifiable, Codable, Equatable {
 
     init(
         id: UUID = UUID(),
+        folder: String = "General",
         body: String = "",
         richTextRTFBase64: String? = nil,
         createdAt: Date = Date(),
         updatedAt: Date = Date()
     ) {
         self.id = id
+        self.folder = folder
         self.body = body
         self.richTextRTFBase64 = richTextRTFBase64
         self.createdAt = createdAt
@@ -50,8 +53,10 @@ struct Note: Identifiable, Codable, Equatable {
 private enum NoteFileCodec {
     private static let separator = "\n---\n"
     private static let formatMarker = "MACNOTES_V2"
+    private static let defaultFolderName = "General"
 
     struct DecodedNotePayload {
+        let folder: String
         let body: String
         let richTextRTFBase64: String?
     }
@@ -60,6 +65,7 @@ private enum NoteFileCodec {
         let serializedRichText = note.richTextRTFBase64 ?? ""
         let header = [
             formatMarker,
+            "folder:\(note.folder)",
             "rtf:\(serializedRichText)"
         ].joined(separator: "\n")
         return header + separator + note.body
@@ -68,15 +74,21 @@ private enum NoteFileCodec {
     static func decode(text: String) -> DecodedNotePayload {
         let chunks = text.components(separatedBy: separator)
         guard chunks.count >= 2 else {
-            return DecodedNotePayload(body: text, richTextRTFBase64: nil)
+            return DecodedNotePayload(folder: defaultFolderName, body: text, richTextRTFBase64: nil)
         }
 
         if chunks[0].hasPrefix(formatMarker) {
             let lines = chunks[0].split(separator: "\n")
+            let folderLine = lines.first(where: { $0.hasPrefix("folder:") })
             let rtfLine = lines.first(where: { $0.hasPrefix("rtf:") })
+            let rawFolder = folderLine.map { String($0.dropFirst("folder:".count)) } ?? defaultFolderName
             let rawRTF = rtfLine.map { String($0.dropFirst("rtf:".count)) }
             let rtfValue = (rawRTF?.isEmpty ?? true) ? nil : rawRTF
+            let folderValue = rawFolder.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? defaultFolderName
+                : rawFolder
             return DecodedNotePayload(
+                folder: folderValue,
                 body: chunks.dropFirst().joined(separator: separator),
                 richTextRTFBase64: rtfValue
             )
@@ -89,29 +101,35 @@ private enum NoteFileCodec {
 
         if isLegacyHeader {
             return DecodedNotePayload(
+                folder: defaultFolderName,
                 body: chunks.dropFirst().joined(separator: separator),
                 richTextRTFBase64: nil
             )
         }
-        return DecodedNotePayload(body: text, richTextRTFBase64: nil)
+        return DecodedNotePayload(folder: defaultFolderName, body: text, richTextRTFBase64: nil)
     }
 }
 
 @MainActor
 final class NotesStore: ObservableObject {
     @Published var notes: [Note] = []
+    @Published var folders: [String] = [NotesStore.defaultFolderName]
     @Published var selectedNoteID: Note.ID?
 
     private let notesDirectoryURL: URL
+    private let foldersFileURL: URL
     private var saveTask: Task<Void, Never>?
+    private static let defaultFolderName = "General"
 
     init() {
         self.notesDirectoryURL = NotesStore.makeStorageURL()
+        self.foldersFileURL = notesDirectoryURL.appendingPathComponent("_folders.meta")
 
         load()
 
         if notes.isEmpty {
             let starter = Note(
+                folder: NotesStore.defaultFolderName,
                 body: "Start writing quick notes from your menu bar."
             )
             notes = [starter]
@@ -127,10 +145,12 @@ final class NotesStore: ObservableObject {
         return notes.first(where: { $0.id == selectedNoteID })
     }
 
-    func addNote() {
-        let note = Note(body: "")
+    func addNote(inFolder folder: String?) {
+        let targetFolder = normalizeFolderName(folder)
+        let note = Note(folder: targetFolder, body: "")
         notes.insert(note, at: 0)
         selectedNoteID = note.id
+        ensureFolderExists(targetFolder)
         scheduleSave()
     }
 
@@ -155,11 +175,37 @@ final class NotesStore: ObservableObject {
         scheduleSave()
     }
 
-    func sortedNotes(matching query: String) -> [Note] {
+    func moveNote(id: Note.ID, toFolder folder: String) {
+        guard let index = notes.firstIndex(where: { $0.id == id }) else { return }
+        let normalized = normalizeFolderName(folder)
+        guard notes[index].folder != normalized else { return }
+        notes[index].folder = normalized
+        notes[index].updatedAt = Date()
+        ensureFolderExists(normalized)
+        scheduleSave()
+    }
+
+    @discardableResult
+    func addFolder(name: String) -> String? {
+        let normalized = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return nil }
+        ensureFolderExists(normalized)
+        scheduleSave()
+        return normalized
+    }
+
+    func sortedNotes(matching query: String, inFolder folder: String?) -> [Note] {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let folderFiltered: [Note]
+        if let folder, !folder.isEmpty {
+            folderFiltered = notes.filter { $0.folder == folder }
+        } else {
+            folderFiltered = notes
+        }
+
         let filtered = trimmed.isEmpty
-            ? notes
-            : notes.filter { note in
+            ? folderFiltered
+            : folderFiltered.filter { note in
                 note.titleLine.localizedCaseInsensitiveContains(trimmed) ||
                 note.body.localizedCaseInsensitiveContains(trimmed)
             }
@@ -171,7 +217,7 @@ final class NotesStore: ObservableObject {
         saveTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(250))
             guard !Task.isCancelled else { return }
-            await self?.saveNow()
+            self?.saveNow()
         }
     }
 
@@ -196,6 +242,9 @@ final class NotesStore: ObservableObject {
                     try? fileManager.removeItem(at: fileURL)
                 }
             }
+
+            let foldersText = folders.joined(separator: "\n")
+            try foldersText.write(to: foldersFileURL, atomically: true, encoding: .utf8)
         } catch {
             NSLog("Failed to save notes: %@", error.localizedDescription)
         }
@@ -206,6 +255,7 @@ final class NotesStore: ObservableObject {
 
         do {
             try fileManager.createDirectory(at: notesDirectoryURL, withIntermediateDirectories: true)
+            loadFolders(fileManager: fileManager)
             let files = try fileManager.contentsOfDirectory(
                 at: notesDirectoryURL,
                 includingPropertiesForKeys: [.creationDateKey, .contentModificationDateKey]
@@ -224,6 +274,7 @@ final class NotesStore: ObservableObject {
                 let decodedPayload = NoteFileCodec.decode(text: text)
                 let note = Note(
                     id: id,
+                    folder: normalizeFolderName(decodedPayload.folder),
                     body: decodedPayload.body,
                     richTextRTFBase64: decodedPayload.richTextRTFBase64,
                     createdAt: createdAt,
@@ -232,8 +283,51 @@ final class NotesStore: ObservableObject {
                 loaded.append(note)
             }
             notes = loaded
+            mergeFoldersFromNotes()
         } catch {
             notes = []
+            folders = [Self.defaultFolderName]
+        }
+    }
+
+    private func loadFolders(fileManager: FileManager) {
+        guard fileManager.fileExists(atPath: foldersFileURL.path) else {
+            folders = [Self.defaultFolderName]
+            return
+        }
+
+        do {
+            let raw = try String(contentsOf: foldersFileURL, encoding: .utf8)
+            let loaded = raw
+                .components(separatedBy: .newlines)
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+            folders = loaded.isEmpty ? [Self.defaultFolderName] : loaded
+            ensureFolderExists(Self.defaultFolderName)
+        } catch {
+            folders = [Self.defaultFolderName]
+        }
+    }
+
+    private func mergeFoldersFromNotes() {
+        for note in notes {
+            ensureFolderExists(note.folder)
+        }
+    }
+
+    private func normalizeFolderName(_ folder: String?) -> String {
+        let trimmed = folder?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? Self.defaultFolderName : trimmed
+    }
+
+    private func ensureFolderExists(_ folder: String) {
+        if !folders.contains(folder) {
+            folders.append(folder)
+            folders.sort { lhs, rhs in
+                if lhs == Self.defaultFolderName { return true }
+                if rhs == Self.defaultFolderName { return false }
+                return lhs.localizedCaseInsensitiveCompare(rhs) == .orderedAscending
+            }
         }
     }
 
@@ -256,20 +350,16 @@ final class NotesStore: ObservableObject {
 
 struct NotesRootView: View {
     @ObservedObject var store: NotesStore
+    @AppStorage("sidebarWidth") private var sidebarWidth = 320.0
     @State private var query = ""
+    @State private var selectedFolder = "All Notes"
     @State private var pendingDeleteNoteID: Note.ID?
-    private let sidebarWidth: CGFloat = 320
-
-    private var isShowingDeleteAlert: Binding<Bool> {
-        Binding(
-            get: { pendingDeleteNoteID != nil },
-            set: { showing in
-                if !showing {
-                    pendingDeleteNoteID = nil
-                }
-            }
-        )
-    }
+    @State private var isPresentingCreateFolderSheet = false
+    @State private var sidebarResizeStartWidth = 320.0
+    @State private var isResizingSidebar = false
+    private let allFoldersLabel = "All Notes"
+    private let minSidebarWidth = 250.0
+    private let maxSidebarWidth = 560.0
 
     private var pendingDeleteNoteLabel: String {
         guard
@@ -282,13 +372,49 @@ struct NotesRootView: View {
         return title.isEmpty ? "this note" : "\"\(title)\""
     }
 
+    private func confirmDelete() {
+        if let pendingDeleteNoteID {
+            store.deleteNote(id: pendingDeleteNoteID)
+        }
+        pendingDeleteNoteID = nil
+    }
+
+    private func cancelDelete() {
+        pendingDeleteNoteID = nil
+    }
+
+    private var activeFolderFilter: String? {
+        selectedFolder == allFoldersLabel ? nil : selectedFolder
+    }
+
+    private func startResizeIfNeeded() {
+        if !isResizingSidebar {
+            isResizingSidebar = true
+            sidebarResizeStartWidth = sidebarWidth
+        }
+    }
+
+    private func applyResize(translation: CGFloat) {
+        let proposed = sidebarResizeStartWidth + Double(translation)
+        sidebarWidth = min(max(proposed, minSidebarWidth), maxSidebarWidth)
+    }
+
     var body: some View {
         HStack(spacing: 0) {
             VStack(spacing: 12) {
+                FolderPickerBar(
+                    selectedFolder: $selectedFolder,
+                    allFoldersLabel: allFoldersLabel,
+                    folders: store.folders,
+                    onCreateFolder: {
+                        isPresentingCreateFolderSheet = true
+                    }
+                )
+
                 SidebarSearchBar(text: $query)
 
                 Button {
-                    store.addNote()
+                    store.addNote(inFolder: activeFolderFilter)
                 } label: {
                     Label("New Note", systemImage: "plus.circle.fill")
                         .font(.system(size: 14, weight: .semibold))
@@ -301,11 +427,18 @@ struct NotesRootView: View {
                 .help("New note")
 
                 List(selection: $store.selectedNoteID) {
-                    ForEach(store.sortedNotes(matching: query)) { note in
+                    ForEach(store.sortedNotes(matching: query, inFolder: activeFolderFilter)) { note in
                         NoteRow(note: note)
                             .tag(note.id)
                             .listRowBackground(Color.clear)
                             .contextMenu {
+                                Menu("Move to Folder") {
+                                    ForEach(store.folders, id: \.self) { folder in
+                                        Button(folder) {
+                                            store.moveNote(id: note.id, toFolder: folder)
+                                        }
+                                    }
+                                }
                                 Button(role: .destructive) {
                                     pendingDeleteNoteID = note.id
                                 } label: {
@@ -318,18 +451,33 @@ struct NotesRootView: View {
                 .scrollContentBackground(.hidden)
                 .background(Color.clear)
             }
-            .frame(width: sidebarWidth)
+            .frame(width: CGFloat(sidebarWidth))
             .padding(14)
             .glassPanel()
             .padding([.leading, .bottom, .top], 12)
+
+            SidebarResizeHandle(isResizing: isResizingSidebar)
+                .gesture(
+                    DragGesture(minimumDistance: 0)
+                        .onChanged { value in
+                            startResizeIfNeeded()
+                            applyResize(translation: value.translation.width)
+                        }
+                        .onEnded { _ in
+                            isResizingSidebar = false
+                        }
+                )
 
             Group {
                 if let note = store.selectedNote {
                     NoteEditorView(note: note) { body, richTextRTFBase64 in
                         store.updateNote(id: note.id, body: body, richTextRTFBase64: richTextRTFBase64)
+                    } onMoveToFolder: { folder in
+                        store.moveNote(id: note.id, toFolder: folder)
                     } onDelete: {
                         pendingDeleteNoteID = note.id
                     }
+                    .environmentObject(store)
                     .id(note.id)
                 } else {
                     EmptyStateView()
@@ -340,19 +488,177 @@ struct NotesRootView: View {
         }
         .frame(width: 900, height: 560)
         .background(LiquidGlassBackground())
-        .alert("Delete note?", isPresented: isShowingDeleteAlert) {
-            Button("Delete", role: .destructive) {
-                if let pendingDeleteNoteID {
-                    store.deleteNote(id: pendingDeleteNoteID)
-                }
-                pendingDeleteNoteID = nil
+        .overlay {
+            if pendingDeleteNoteID != nil {
+                DeleteConfirmationOverlay(
+                    message: "Are you sure you want to delete \(pendingDeleteNoteLabel)? This action cannot be undone.",
+                    onDelete: confirmDelete,
+                    onCancel: cancelDelete
+                )
+                .transition(.opacity)
+                .zIndex(2)
             }
-            Button("Cancel", role: .cancel) {
-                pendingDeleteNoteID = nil
-            }
-        } message: {
-            Text("Are you sure you want to delete \(pendingDeleteNoteLabel)? This action cannot be undone.")
         }
+        .sheet(isPresented: $isPresentingCreateFolderSheet) {
+            CreateFolderSheet { name in
+                if let createdFolder = store.addFolder(name: name) {
+                    selectedFolder = createdFolder
+                }
+            }
+        }
+        .animation(.easeInOut(duration: 0.12), value: pendingDeleteNoteID != nil)
+        .onChange(of: store.folders) { _ in
+            if selectedFolder != allFoldersLabel && !store.folders.contains(selectedFolder) {
+                selectedFolder = allFoldersLabel
+            }
+        }
+    }
+}
+
+struct DeleteConfirmationOverlay: View {
+    let message: String
+    let onDelete: () -> Void
+    let onCancel: () -> Void
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.28)
+                .ignoresSafeArea()
+
+            VStack(alignment: .leading, spacing: 14) {
+                Text("Delete note?")
+                    .font(.title3.weight(.semibold))
+                Text(message)
+                    .font(.body)
+                    .foregroundStyle(.secondary)
+
+                HStack(spacing: 10) {
+                    Spacer()
+                    Button("Cancel") {
+                        onCancel()
+                    }
+                    .keyboardShortcut(.cancelAction)
+
+                    Button("Delete") {
+                        onDelete()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.red)
+                    .keyboardShortcut(.defaultAction)
+                }
+            }
+            .padding(18)
+            .frame(width: 400)
+            .background(
+                VisualEffectBlurView(material: .popover, blendingMode: .withinWindow)
+                    .opacity(0.94)
+                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .stroke(.white.opacity(0.20), lineWidth: 1)
+            )
+            .shadow(color: .black.opacity(0.22), radius: 22, x: 0, y: 8)
+        }
+    }
+}
+
+struct FolderPickerBar: View {
+    @Binding var selectedFolder: String
+    let allFoldersLabel: String
+    let folders: [String]
+    let onCreateFolder: () -> Void
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Menu {
+                Button(allFoldersLabel) {
+                    selectedFolder = allFoldersLabel
+                }
+                Divider()
+                ForEach(folders, id: \.self) { folder in
+                    Button {
+                        selectedFolder = folder
+                    } label: {
+                        if selectedFolder == folder {
+                            Label(folder, systemImage: "checkmark")
+                        } else {
+                            Text(folder)
+                        }
+                    }
+                }
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "folder")
+                    Text(selectedFolder)
+                        .lineLimit(1)
+                    Spacer(minLength: 4)
+                    Image(systemName: "chevron.down")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                }
+                .font(.system(size: 13, weight: .semibold))
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .buttonStyle(.bordered)
+
+            Button {
+                onCreateFolder()
+            } label: {
+                Image(systemName: "folder.badge.plus")
+            }
+            .buttonStyle(.bordered)
+            .help("Create folder")
+        }
+    }
+}
+
+struct SidebarResizeHandle: View {
+    let isResizing: Bool
+
+    var body: some View {
+        ZStack {
+            Color.clear
+            RoundedRectangle(cornerRadius: 2, style: .continuous)
+                .fill(isResizing ? .white.opacity(0.42) : .white.opacity(0.18))
+                .frame(width: 3)
+                .padding(.vertical, 18)
+        }
+        .frame(width: 10)
+        .contentShape(Rectangle())
+    }
+}
+
+struct CreateFolderSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @State private var folderName = ""
+    let onCreate: (String) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("New Folder")
+                .font(.title3.weight(.semibold))
+
+            TextField("Folder name", text: $folderName)
+                .textFieldStyle(.roundedBorder)
+
+            HStack(spacing: 10) {
+                Spacer()
+                Button("Cancel") {
+                    dismiss()
+                }
+                Button("Create") {
+                    onCreate(folderName)
+                    dismiss()
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(folderName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(18)
+        .frame(width: 340)
     }
 }
 
@@ -407,21 +713,30 @@ struct NoteRow: View {
 }
 
 struct NoteEditorView: View {
+    @EnvironmentObject private var store: NotesStore
     let note: Note
     let onChange: (String, String?) -> Void
+    let onMoveToFolder: (String) -> Void
     let onDelete: () -> Void
 
     @State private var noteContent: String
     @State private var richTextRTFBase64: String?
     @State private var hasSelection = false
+    @State private var isPresentingCreateFolderSheet = false
     @State private var boldTrigger = 0
     @State private var underlineTrigger = 0
     @State private var increaseFontTrigger = 0
     @State private var decreaseFontTrigger = 0
 
-    init(note: Note, onChange: @escaping (String, String?) -> Void, onDelete: @escaping () -> Void) {
+    init(
+        note: Note,
+        onChange: @escaping (String, String?) -> Void,
+        onMoveToFolder: @escaping (String) -> Void,
+        onDelete: @escaping () -> Void
+    ) {
         self.note = note
         self.onChange = onChange
+        self.onMoveToFolder = onMoveToFolder
         self.onDelete = onDelete
         _noteContent = State(initialValue: note.body)
         _richTextRTFBase64 = State(initialValue: note.richTextRTFBase64)
@@ -465,6 +780,28 @@ struct NoteEditorView: View {
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.large)
+
+                Menu {
+                    ForEach(store.folders, id: \.self) { folder in
+                        Button {
+                            onMoveToFolder(folder)
+                        } label: {
+                            if folder == note.folder {
+                                Label(folder, systemImage: "checkmark")
+                            } else {
+                                Text(folder)
+                            }
+                        }
+                    }
+                    Divider()
+                    Button("New Folder...") {
+                        isPresentingCreateFolderSheet = true
+                    }
+                } label: {
+                    Label(note.folder, systemImage: "folder")
+                }
+                .buttonStyle(.bordered)
+
                 Button(role: .destructive) {
                     onDelete()
                 } label: {
@@ -507,9 +844,17 @@ struct NoteEditorView: View {
         .onChange(of: richTextRTFBase64) { _ in
             onChange(noteContent, richTextRTFBase64)
         }
+        .sheet(isPresented: $isPresentingCreateFolderSheet) {
+            CreateFolderSheet { name in
+                if let createdFolder = store.addFolder(name: name) {
+                    onMoveToFolder(createdFolder)
+                }
+            }
+        }
     }
 }
 
+@MainActor
 struct RichTextEditor: NSViewRepresentable {
     @Binding var text: String
     @Binding var richTextRTFBase64: String?
@@ -597,6 +942,7 @@ struct RichTextEditor: NSViewRepresentable {
         )
     }
 
+    @MainActor
     final class Coordinator: NSObject, NSTextViewDelegate {
         var parent: RichTextEditor
         weak var textView: ShortcutTextView?
@@ -682,7 +1028,7 @@ struct RichTextEditor: NSViewRepresentable {
             return selectedRange.length > 0 ? selectedRange : nil
         }
 
-        private func toggleBoldForSelection() {
+        func toggleBoldForSelection() {
             guard
                 let textView,
                 let textStorage = textView.textStorage,
@@ -711,7 +1057,7 @@ struct RichTextEditor: NSViewRepresentable {
             publishState()
         }
 
-        private func toggleUnderlineForSelection() {
+        func toggleUnderlineForSelection() {
             guard
                 let textView,
                 let textStorage = textView.textStorage,
@@ -731,7 +1077,7 @@ struct RichTextEditor: NSViewRepresentable {
             publishState()
         }
 
-        private func adjustFontSizeForSelection(delta: CGFloat) {
+        func adjustFontSizeForSelection(delta: CGFloat) {
             guard
                 let textView,
                 let textStorage = textView.textStorage,
