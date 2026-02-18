@@ -44,21 +44,11 @@ struct Note: Identifiable, Codable, Equatable {
 
 private enum NoteFileCodec {
     private static let separator = "\n---\n"
-    private static let formatterWithFractional: ISO8601DateFormatter = {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter
-    }()
-    private static let formatterPlain: ISO8601DateFormatter = {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime]
-        return formatter
-    }()
 
     static func encode(note: Note) -> String {
         let titleLine = "title:\(note.title.replacingOccurrences(of: "\n", with: " "))"
-        let createdLine = "createdAt:\(formatterWithFractional.string(from: note.createdAt))"
-        let updatedLine = "updatedAt:\(formatterWithFractional.string(from: note.updatedAt))"
+        let createdLine = "createdAt:\(formatDate(note.createdAt))"
+        let updatedLine = "updatedAt:\(formatDate(note.updatedAt))"
         return [titleLine, createdLine, updatedLine].joined(separator: "\n") + separator + note.body
     }
 
@@ -107,7 +97,20 @@ private enum NoteFileCodec {
     }
 
     private static func parseDate(_ rawDate: String) -> Date? {
-        formatterWithFractional.date(from: rawDate) ?? formatterPlain.date(from: rawDate)
+        makeFormatter(fractionalSeconds: true).date(from: rawDate) ??
+            makeFormatter(fractionalSeconds: false).date(from: rawDate)
+    }
+
+    private static func formatDate(_ date: Date) -> String {
+        makeFormatter(fractionalSeconds: true).string(from: date)
+    }
+
+    private static func makeFormatter(fractionalSeconds: Bool) -> ISO8601DateFormatter {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = fractionalSeconds
+            ? [.withInternetDateTime, .withFractionalSeconds]
+            : [.withInternetDateTime]
+        return formatter
     }
 }
 
