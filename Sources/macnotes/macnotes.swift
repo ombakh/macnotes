@@ -23,17 +23,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 struct Note: Identifiable, Codable, Equatable {
     let id: UUID
     var body: String
+    var richTextRTFBase64: String?
     let createdAt: Date
     var updatedAt: Date
 
     init(
         id: UUID = UUID(),
         body: String = "",
+        richTextRTFBase64: String? = nil,
         createdAt: Date = Date(),
         updatedAt: Date = Date()
     ) {
         self.id = id
         self.body = body
+        self.richTextRTFBase64 = richTextRTFBase64
         self.createdAt = createdAt
         self.updatedAt = updatedAt
     }
@@ -45,14 +48,39 @@ struct Note: Identifiable, Codable, Equatable {
 }
 
 private enum NoteFileCodec {
-    static func encode(note: Note) -> String {
-        note.body
+    private static let separator = "\n---\n"
+    private static let formatMarker = "MACNOTES_V2"
+
+    struct DecodedNotePayload {
+        let body: String
+        let richTextRTFBase64: String?
     }
 
-    static func decodeBody(text: String) -> String {
-        let separator = "\n---\n"
+    static func encode(note: Note) -> String {
+        let serializedRichText = note.richTextRTFBase64 ?? ""
+        let header = [
+            formatMarker,
+            "rtf:\(serializedRichText)"
+        ].joined(separator: "\n")
+        return header + separator + note.body
+    }
+
+    static func decode(text: String) -> DecodedNotePayload {
         let chunks = text.components(separatedBy: separator)
-        guard chunks.count >= 2 else { return text }
+        guard chunks.count >= 2 else {
+            return DecodedNotePayload(body: text, richTextRTFBase64: nil)
+        }
+
+        if chunks[0].hasPrefix(formatMarker) {
+            let lines = chunks[0].split(separator: "\n")
+            let rtfLine = lines.first(where: { $0.hasPrefix("rtf:") })
+            let rawRTF = rtfLine.map { String($0.dropFirst("rtf:".count)) }
+            let rtfValue = (rawRTF?.isEmpty ?? true) ? nil : rawRTF
+            return DecodedNotePayload(
+                body: chunks.dropFirst().joined(separator: separator),
+                richTextRTFBase64: rtfValue
+            )
+        }
 
         let headerLines = chunks[0].split(separator: "\n")
         let isLegacyHeader = headerLines.contains(where: { $0.hasPrefix("title:") }) ||
@@ -60,9 +88,12 @@ private enum NoteFileCodec {
             headerLines.contains(where: { $0.hasPrefix("updatedAt:") })
 
         if isLegacyHeader {
-            return chunks.dropFirst().joined(separator: separator)
+            return DecodedNotePayload(
+                body: chunks.dropFirst().joined(separator: separator),
+                richTextRTFBase64: nil
+            )
         }
-        return text
+        return DecodedNotePayload(body: text, richTextRTFBase64: nil)
     }
 }
 
@@ -112,13 +143,14 @@ final class NotesStore: ObservableObject {
         scheduleSave()
     }
 
-    func updateNote(id: Note.ID, body: String) {
+    func updateNote(id: Note.ID, body: String, richTextRTFBase64: String?) {
         guard let index = notes.firstIndex(where: { $0.id == id }) else { return }
         let existing = notes[index]
 
-        guard existing.body != body else { return }
+        guard existing.body != body || existing.richTextRTFBase64 != richTextRTFBase64 else { return }
 
         notes[index].body = body
+        notes[index].richTextRTFBase64 = richTextRTFBase64
         notes[index].updatedAt = Date()
         scheduleSave()
     }
@@ -189,9 +221,11 @@ final class NotesStore: ObservableObject {
                 let createdAt = values?.creationDate ?? Date()
                 let updatedAt = values?.contentModificationDate ?? createdAt
                 let text = try String(contentsOf: fileURL, encoding: .utf8)
+                let decodedPayload = NoteFileCodec.decode(text: text)
                 let note = Note(
                     id: id,
-                    body: NoteFileCodec.decodeBody(text: text),
+                    body: decodedPayload.body,
+                    richTextRTFBase64: decodedPayload.richTextRTFBase64,
                     createdAt: createdAt,
                     updatedAt: updatedAt
                 )
@@ -291,8 +325,8 @@ struct NotesRootView: View {
 
             Group {
                 if let note = store.selectedNote {
-                    NoteEditorView(note: note) { body in
-                        store.updateNote(id: note.id, body: body)
+                    NoteEditorView(note: note) { body, richTextRTFBase64 in
+                        store.updateNote(id: note.id, body: body, richTextRTFBase64: richTextRTFBase64)
                     } onDelete: {
                         pendingDeleteNoteID = note.id
                     }
@@ -374,30 +408,28 @@ struct NoteRow: View {
 
 struct NoteEditorView: View {
     let note: Note
-    let onChange: (String) -> Void
+    let onChange: (String, String?) -> Void
     let onDelete: () -> Void
 
     @State private var noteContent: String
+    @State private var richTextRTFBase64: String?
     @State private var hasSelection = false
     @State private var boldTrigger = 0
     @State private var underlineTrigger = 0
     @State private var increaseFontTrigger = 0
     @State private var decreaseFontTrigger = 0
 
-    init(note: Note, onChange: @escaping (String) -> Void, onDelete: @escaping () -> Void) {
+    init(note: Note, onChange: @escaping (String, String?) -> Void, onDelete: @escaping () -> Void) {
         self.note = note
         self.onChange = onChange
         self.onDelete = onDelete
         _noteContent = State(initialValue: note.body)
+        _richTextRTFBase64 = State(initialValue: note.richTextRTFBase64)
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Text("Formatting")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                Spacer()
                 HStack(spacing: 10) {
                     Button {
                         boldTrigger += 1
@@ -440,16 +472,9 @@ struct NoteEditorView: View {
                 }
             }
 
-            Text("The first line of your note is used as the title.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
-            Text(hasSelection ? "Formatting applies to selected text." : "Select text to apply bold, underline, or font-size changes.")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-
             RichTextEditor(
                 text: $noteContent,
+                richTextRTFBase64: $richTextRTFBase64,
                 hasSelection: $hasSelection,
                 boldTrigger: boldTrigger,
                 underlineTrigger: underlineTrigger,
@@ -477,13 +502,17 @@ struct NoteEditorView: View {
         .padding(14)
         .glassPanel()
         .onChange(of: noteContent) { _ in
-            onChange(noteContent)
+            onChange(noteContent, richTextRTFBase64)
+        }
+        .onChange(of: richTextRTFBase64) { _ in
+            onChange(noteContent, richTextRTFBase64)
         }
     }
 }
 
 struct RichTextEditor: NSViewRepresentable {
     @Binding var text: String
+    @Binding var richTextRTFBase64: String?
     @Binding var hasSelection: Bool
     let boldTrigger: Int
     let underlineTrigger: Int
@@ -495,7 +524,7 @@ struct RichTextEditor: NSViewRepresentable {
     }
 
     func makeNSView(context: Context) -> NSScrollView {
-        let textView = NSTextView(frame: .zero)
+        let textView = ShortcutTextView(frame: .zero)
         textView.delegate = context.coordinator
         textView.isRichText = true
         textView.drawsBackground = false
@@ -517,9 +546,33 @@ struct RichTextEditor: NSViewRepresentable {
             .foregroundColor: NSColor.labelColor
         ]
         textView.insertionPointColor = .labelColor
-
         context.coordinator.textView = textView
+
+        if let serializedRTF = richTextRTFBase64,
+           let rtfData = Data(base64Encoded: serializedRTF),
+           let attributed = try? NSAttributedString(
+               data: rtfData,
+               options: [.documentType: NSAttributedString.DocumentType.rtf],
+               documentAttributes: nil
+           ) {
+            textView.textStorage?.setAttributedString(attributed)
+            text = textView.string
+        }
+
         context.coordinator.syncSelectionState()
+        context.coordinator.publishState()
+        textView.onToggleBold = { [weak coordinator = context.coordinator] in
+            coordinator?.toggleBoldForSelection()
+        }
+        textView.onToggleUnderline = { [weak coordinator = context.coordinator] in
+            coordinator?.toggleUnderlineForSelection()
+        }
+        textView.onIncreaseFont = { [weak coordinator = context.coordinator] in
+            coordinator?.adjustFontSizeForSelection(delta: 1)
+        }
+        textView.onDecreaseFont = { [weak coordinator = context.coordinator] in
+            coordinator?.adjustFontSizeForSelection(delta: -1)
+        }
 
         let scrollView = NSScrollView()
         scrollView.borderType = .noBorder
@@ -532,7 +585,7 @@ struct RichTextEditor: NSViewRepresentable {
     func updateNSView(_ nsView: NSScrollView, context: Context) {
         context.coordinator.parent = self
         guard let textView = context.coordinator.textView else { return }
-        if textView.string != text {
+        if textView.string != text, textView.window?.firstResponder !== textView {
             textView.string = text
         }
         context.coordinator.syncSelectionState()
@@ -546,7 +599,7 @@ struct RichTextEditor: NSViewRepresentable {
 
     final class Coordinator: NSObject, NSTextViewDelegate {
         var parent: RichTextEditor
-        weak var textView: NSTextView?
+        weak var textView: ShortcutTextView?
         private var lastBoldTrigger = 0
         private var lastUnderlineTrigger = 0
         private var lastIncreaseFontTrigger = 0
@@ -557,10 +610,7 @@ struct RichTextEditor: NSViewRepresentable {
         }
 
         func textDidChange(_ notification: Notification) {
-            guard let textView else { return }
-            if parent.text != textView.string {
-                parent.text = textView.string
-            }
+            publishState()
         }
 
         func textViewDidChangeSelection(_ notification: Notification) {
@@ -573,6 +623,30 @@ struct RichTextEditor: NSViewRepresentable {
             if parent.hasSelection != hasSelection {
                 parent.hasSelection = hasSelection
             }
+        }
+
+        func publishState() {
+            guard let textView else { return }
+            let plainText = textView.string
+            let rtfBase64 = serializedRTF(from: textView.textStorage) ?? parent.richTextRTFBase64
+            if parent.text != plainText {
+                parent.text = plainText
+            }
+            if parent.richTextRTFBase64 != rtfBase64 {
+                parent.richTextRTFBase64 = rtfBase64
+            }
+        }
+
+        private func serializedRTF(from storage: NSTextStorage?) -> String? {
+            guard let storage, storage.length > 0 else { return nil }
+            let range = NSRange(location: 0, length: storage.length)
+            guard let data = try? storage.data(
+                from: range,
+                documentAttributes: [.documentType: NSAttributedString.DocumentType.rtf]
+            ) else {
+                return nil
+            }
+            return data.base64EncodedString()
         }
 
         func handleTriggers(
@@ -634,6 +708,7 @@ struct RichTextEditor: NSViewRepresentable {
                 textStorage.addAttribute(.foregroundColor, value: NSColor.labelColor, range: range)
             }
             textStorage.endEditing()
+            publishState()
         }
 
         private func toggleUnderlineForSelection() {
@@ -653,6 +728,7 @@ struct RichTextEditor: NSViewRepresentable {
 
             let targetStyle = allUnderlined ? 0 : NSUnderlineStyle.single.rawValue
             textStorage.addAttribute(.underlineStyle, value: targetStyle, range: selectedRange)
+            publishState()
         }
 
         private func adjustFontSizeForSelection(delta: CGFloat) {
@@ -671,7 +747,40 @@ struct RichTextEditor: NSViewRepresentable {
                 textStorage.addAttribute(.foregroundColor, value: NSColor.labelColor, range: range)
             }
             textStorage.endEditing()
+            publishState()
         }
+    }
+}
+
+final class ShortcutTextView: NSTextView {
+    var onToggleBold: (() -> Void)?
+    var onToggleUnderline: (() -> Void)?
+    var onIncreaseFont: (() -> Void)?
+    var onDecreaseFont: (() -> Void)?
+
+    override func keyDown(with event: NSEvent) {
+        let flags = event.modifierFlags.intersection([.command, .control, .shift])
+        let usesFormattingShortcut = flags.contains(.command) || flags.contains(.control)
+
+        if usesFormattingShortcut, let key = event.charactersIgnoringModifiers?.lowercased() {
+            switch key {
+            case "b":
+                onToggleBold?()
+                return
+            case "u":
+                onToggleUnderline?()
+                return
+            case "=", "+":
+                onIncreaseFont?()
+                return
+            case "-", "_":
+                onDecreaseFont?()
+                return
+            default:
+                break
+            }
+        }
+        super.keyDown(with: event)
     }
 }
 
