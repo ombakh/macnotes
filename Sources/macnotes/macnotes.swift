@@ -4,19 +4,108 @@ import SwiftUI
 @main
 struct MacNotesApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    @StateObject private var store = NotesStore()
 
     var body: some Scene {
-        MenuBarExtra("Glass Notes", systemImage: "note.text") {
-            NotesRootView(store: store)
+        Settings {
+            EmptyView()
         }
-        .menuBarExtraStyle(.window)
     }
 }
 
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    private let store = NotesStore()
+    private var statusItem: NSStatusItem?
+    private let popover = NSPopover()
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        configurePopover()
+        configureStatusItem()
+    }
+
+    private func configurePopover() {
+        popover.behavior = .transient
+        popover.animates = true
+        popover.contentSize = NSSize(width: 900, height: 560)
+        popover.contentViewController = NSHostingController(rootView: NotesRootView(store: store))
+    }
+
+    private func configureStatusItem() {
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        statusItem = item
+
+        guard let button = item.button else { return }
+        button.image = NSImage(systemSymbolName: "note.text", accessibilityDescription: "MacNotes")
+        button.image?.isTemplate = true
+        button.toolTip = "MacNotes"
+        button.target = self
+        button.action = #selector(handleStatusItemClick)
+        button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+    }
+
+    @objc private func handleStatusItemClick() {
+        guard let event = NSApp.currentEvent else {
+            togglePopover()
+            return
+        }
+
+        switch event.type {
+        case .rightMouseUp:
+            showContextMenu()
+        default:
+            togglePopover()
+        }
+    }
+
+    private func togglePopover() {
+        if popover.isShown {
+            popover.performClose(nil)
+            return
+        }
+        showPopover()
+    }
+
+    private func showPopover() {
+        guard let button = statusItem?.button else { return }
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func showContextMenu() {
+        let menu = NSMenu()
+
+        let openTitle = popover.isShown ? "Hide Notes" : "Show Notes"
+        let toggleItem = NSMenuItem(title: openTitle, action: #selector(toggleNotesWindow), keyEquivalent: "")
+        toggleItem.target = self
+        menu.addItem(toggleItem)
+
+        let newNoteItem = NSMenuItem(title: "New Note", action: #selector(createNoteFromMenu), keyEquivalent: "n")
+        newNoteItem.target = self
+        menu.addItem(newNoteItem)
+
+        menu.addItem(.separator())
+
+        let quitItem = NSMenuItem(title: "Quit MacNotes", action: #selector(quitApp), keyEquivalent: "q")
+        quitItem.target = self
+        menu.addItem(quitItem)
+
+        statusItem?.menu = menu
+        statusItem?.button?.performClick(nil)
+        statusItem?.menu = nil
+    }
+
+    @objc private func toggleNotesWindow() {
+        togglePopover()
+    }
+
+    @objc private func createNoteFromMenu() {
+        store.addNote(inFolder: nil)
+        showPopover()
+    }
+
+    @objc private func quitApp() {
+        NSApp.terminate(nil)
     }
 }
 
@@ -354,6 +443,7 @@ struct NotesRootView: View {
     @State private var query = ""
     @State private var selectedFolder = "All Notes"
     @State private var pendingDeleteNoteID: Note.ID?
+    @State private var folderCreationTargetNoteID: Note.ID?
     @State private var isPresentingCreateFolderSheet = false
     @State private var sidebarResizeStartWidth = 320.0
     @State private var isResizingSidebar = false
@@ -383,6 +473,27 @@ struct NotesRootView: View {
         pendingDeleteNoteID = nil
     }
 
+    private func openCreateFolder(targetNoteID: Note.ID?) {
+        folderCreationTargetNoteID = targetNoteID
+        isPresentingCreateFolderSheet = true
+    }
+
+    private func cancelCreateFolder() {
+        isPresentingCreateFolderSheet = false
+        folderCreationTargetNoteID = nil
+    }
+
+    private func createFolder(name: String) {
+        if let createdFolder = store.addFolder(name: name) {
+            if let folderCreationTargetNoteID {
+                store.moveNote(id: folderCreationTargetNoteID, toFolder: createdFolder)
+            } else {
+                selectedFolder = createdFolder
+            }
+        }
+        cancelCreateFolder()
+    }
+
     private var activeFolderFilter: String? {
         selectedFolder == allFoldersLabel ? nil : selectedFolder
     }
@@ -407,7 +518,7 @@ struct NotesRootView: View {
                     allFoldersLabel: allFoldersLabel,
                     folders: store.folders,
                     onCreateFolder: {
-                        isPresentingCreateFolderSheet = true
+                        openCreateFolder(targetNoteID: nil)
                     }
                 )
 
@@ -474,6 +585,8 @@ struct NotesRootView: View {
                         store.updateNote(id: note.id, body: body, richTextRTFBase64: richTextRTFBase64)
                     } onMoveToFolder: { folder in
                         store.moveNote(id: note.id, toFolder: folder)
+                    } onRequestCreateFolder: {
+                        openCreateFolder(targetNoteID: note.id)
                     } onDelete: {
                         pendingDeleteNoteID = note.id
                     }
@@ -498,15 +611,17 @@ struct NotesRootView: View {
                 .transition(.opacity)
                 .zIndex(2)
             }
-        }
-        .sheet(isPresented: $isPresentingCreateFolderSheet) {
-            CreateFolderSheet { name in
-                if let createdFolder = store.addFolder(name: name) {
-                    selectedFolder = createdFolder
-                }
+            if isPresentingCreateFolderSheet {
+                CreateFolderOverlay(
+                    onCreate: createFolder,
+                    onCancel: cancelCreateFolder
+                )
+                .transition(.opacity)
+                .zIndex(3)
             }
         }
         .animation(.easeInOut(duration: 0.12), value: pendingDeleteNoteID != nil)
+        .animation(.easeInOut(duration: 0.12), value: isPresentingCreateFolderSheet)
         .onChange(of: store.folders) { _ in
             if selectedFolder != allFoldersLabel && !store.folders.contains(selectedFolder) {
                 selectedFolder = allFoldersLabel
@@ -631,34 +746,51 @@ struct SidebarResizeHandle: View {
     }
 }
 
-struct CreateFolderSheet: View {
-    @Environment(\.dismiss) private var dismiss
+struct CreateFolderOverlay: View {
     @State private var folderName = ""
     let onCreate: (String) -> Void
+    let onCancel: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("New Folder")
-                .font(.title3.weight(.semibold))
+        ZStack {
+            Color.black.opacity(0.28)
+                .ignoresSafeArea()
 
-            TextField("Folder name", text: $folderName)
-                .textFieldStyle(.roundedBorder)
+            VStack(alignment: .leading, spacing: 14) {
+                Text("New Folder")
+                    .font(.title3.weight(.semibold))
 
-            HStack(spacing: 10) {
-                Spacer()
-                Button("Cancel") {
-                    dismiss()
+                TextField("Folder name", text: $folderName)
+                    .textFieldStyle(.roundedBorder)
+
+                HStack(spacing: 10) {
+                    Spacer()
+                    Button("Cancel") {
+                        onCancel()
+                    }
+                    .keyboardShortcut(.cancelAction)
+
+                    Button("Create") {
+                        onCreate(folderName)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(folderName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
-                Button("Create") {
-                    onCreate(folderName)
-                    dismiss()
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(folderName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
+            .padding(18)
+            .frame(width: 360)
+            .background(
+                VisualEffectBlurView(material: .popover, blendingMode: .withinWindow)
+                    .opacity(0.94)
+                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .stroke(.white.opacity(0.20), lineWidth: 1)
+            )
+            .shadow(color: .black.opacity(0.22), radius: 22, x: 0, y: 8)
         }
-        .padding(18)
-        .frame(width: 340)
     }
 }
 
@@ -717,12 +849,12 @@ struct NoteEditorView: View {
     let note: Note
     let onChange: (String, String?) -> Void
     let onMoveToFolder: (String) -> Void
+    let onRequestCreateFolder: () -> Void
     let onDelete: () -> Void
 
     @State private var noteContent: String
     @State private var richTextRTFBase64: String?
     @State private var hasSelection = false
-    @State private var isPresentingCreateFolderSheet = false
     @State private var boldTrigger = 0
     @State private var underlineTrigger = 0
     @State private var increaseFontTrigger = 0
@@ -732,11 +864,13 @@ struct NoteEditorView: View {
         note: Note,
         onChange: @escaping (String, String?) -> Void,
         onMoveToFolder: @escaping (String) -> Void,
+        onRequestCreateFolder: @escaping () -> Void,
         onDelete: @escaping () -> Void
     ) {
         self.note = note
         self.onChange = onChange
         self.onMoveToFolder = onMoveToFolder
+        self.onRequestCreateFolder = onRequestCreateFolder
         self.onDelete = onDelete
         _noteContent = State(initialValue: note.body)
         _richTextRTFBase64 = State(initialValue: note.richTextRTFBase64)
@@ -795,7 +929,7 @@ struct NoteEditorView: View {
                     }
                     Divider()
                     Button("New Folder...") {
-                        isPresentingCreateFolderSheet = true
+                        onRequestCreateFolder()
                     }
                 } label: {
                     Label(note.folder, systemImage: "folder")
@@ -843,13 +977,6 @@ struct NoteEditorView: View {
         }
         .onChange(of: richTextRTFBase64) { _ in
             onChange(noteContent, richTextRTFBase64)
-        }
-        .sheet(isPresented: $isPresentingCreateFolderSheet) {
-            CreateFolderSheet { name in
-                if let createdFolder = store.addFolder(name: name) {
-                    onMoveToFolder(createdFolder)
-                }
-            }
         }
     }
 }
@@ -1029,11 +1156,14 @@ struct RichTextEditor: NSViewRepresentable {
         }
 
         func toggleBoldForSelection() {
+            guard let textView else { return }
             guard
-                let textView,
                 let textStorage = textView.textStorage,
                 let selectedRange = selectedRangeIfAny()
-            else { return }
+            else {
+                toggleTypingBold(textView: textView)
+                return
+            }
 
             var allBold = true
             textStorage.enumerateAttribute(.font, in: selectedRange, options: []) { value, _, _ in
@@ -1058,11 +1188,14 @@ struct RichTextEditor: NSViewRepresentable {
         }
 
         func toggleUnderlineForSelection() {
+            guard let textView else { return }
             guard
-                let textView,
                 let textStorage = textView.textStorage,
                 let selectedRange = selectedRangeIfAny()
-            else { return }
+            else {
+                toggleTypingUnderline(textView: textView)
+                return
+            }
 
             var allUnderlined = true
             textStorage.enumerateAttribute(.underlineStyle, in: selectedRange, options: []) { value, _, _ in
@@ -1078,11 +1211,14 @@ struct RichTextEditor: NSViewRepresentable {
         }
 
         func adjustFontSizeForSelection(delta: CGFloat) {
+            guard let textView else { return }
             guard
-                let textView,
                 let textStorage = textView.textStorage,
                 let selectedRange = selectedRangeIfAny()
-            else { return }
+            else {
+                adjustTypingFontSize(textView: textView, delta: delta)
+                return
+            }
 
             textStorage.beginEditing()
             textStorage.enumerateAttribute(.font, in: selectedRange, options: []) { value, range, _ in
@@ -1094,6 +1230,39 @@ struct RichTextEditor: NSViewRepresentable {
             }
             textStorage.endEditing()
             publishState()
+        }
+
+        private func toggleTypingBold(textView: NSTextView) {
+            var attrs = textView.typingAttributes
+            let currentFont = (attrs[.font] as? NSFont) ?? NSFont.systemFont(ofSize: 16)
+            let isBold = NSFontManager.shared.traits(of: currentFont).contains(.boldFontMask)
+            let converted = isBold
+                ? NSFontManager.shared.convert(currentFont, toNotHaveTrait: .boldFontMask)
+                : NSFontManager.shared.convert(currentFont, toHaveTrait: .boldFontMask)
+            let resized = NSFontManager.shared.convert(converted, toSize: currentFont.pointSize)
+            attrs[.font] = resized
+            attrs[.foregroundColor] = NSColor.labelColor
+            textView.typingAttributes = attrs
+        }
+
+        private func toggleTypingUnderline(textView: NSTextView) {
+            var attrs = textView.typingAttributes
+            let currentStyle = (attrs[.underlineStyle] as? NSNumber)?.intValue ??
+                (attrs[.underlineStyle] as? Int) ?? 0
+            let nextStyle = currentStyle == 0 ? NSUnderlineStyle.single.rawValue : 0
+            attrs[.underlineStyle] = nextStyle
+            attrs[.foregroundColor] = NSColor.labelColor
+            textView.typingAttributes = attrs
+        }
+
+        private func adjustTypingFontSize(textView: NSTextView, delta: CGFloat) {
+            var attrs = textView.typingAttributes
+            let currentFont = (attrs[.font] as? NSFont) ?? NSFont.systemFont(ofSize: 16)
+            let nextSize = min(40, max(10, currentFont.pointSize + delta))
+            let resized = NSFontManager.shared.convert(currentFont, toSize: nextSize)
+            attrs[.font] = resized
+            attrs[.foregroundColor] = NSColor.labelColor
+            textView.typingAttributes = attrs
         }
     }
 }
