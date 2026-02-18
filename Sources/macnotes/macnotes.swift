@@ -276,31 +276,21 @@ struct NotesRootView: View {
 
     var body: some View {
         NavigationSplitView {
-            VStack(spacing: 10) {
-                HStack(spacing: 8) {
-                    HStack(spacing: 8) {
-                        Image(systemName: "magnifyingglass")
-                            .foregroundStyle(.white.opacity(0.78))
-                        TextField("Search notes", text: $query)
-                            .textFieldStyle(.plain)
-                    }
-                    .font(.system(size: 15, weight: .medium))
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 10)
-                    .frame(maxWidth: .infinity)
-                    .background(.white.opacity(0.16), in: Capsule())
-                    .overlay(
-                        Capsule()
-                            .stroke(.white.opacity(0.26), lineWidth: 1)
-                    )
-                    Button {
-                        store.addNote()
-                    } label: {
-                        Image(systemName: "plus")
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .help("New note")
+            VStack(spacing: 12) {
+                SidebarSearchBar(text: $query)
+
+                Button {
+                    store.addNote()
+                } label: {
+                    Label("New Note", systemImage: "plus.circle.fill")
+                        .font(.system(size: 14, weight: .semibold))
+                        .frame(maxWidth: .infinity)
                 }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+                .tint(.white.opacity(0.2))
+                .foregroundStyle(.white)
+                .help("New note")
 
                 List(selection: $store.selectedNoteID) {
                     ForEach(store.sortedNotes(matching: query)) { note in
@@ -317,8 +307,9 @@ struct NotesRootView: View {
                 }
                 .listStyle(.inset)
             }
-            .padding(12)
+            .padding(14)
             .glassPanel()
+            .navigationSplitViewColumnWidth(min: 300, ideal: 320)
             .padding([.leading, .bottom, .top], 12)
         } detail: {
             Group {
@@ -337,6 +328,40 @@ struct NotesRootView: View {
         }
         .frame(width: 760, height: 520)
         .background(LiquidGlassBackground())
+    }
+}
+
+struct SidebarSearchBar: View {
+    @Binding var text: String
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.82))
+
+            TextField("Search notes", text: $text)
+                .textFieldStyle(.plain)
+                .font(.system(size: 16, weight: .medium))
+                .foregroundStyle(.white)
+
+            if !text.isEmpty {
+                Button {
+                    text = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.white.opacity(0.65))
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(.white.opacity(0.34), lineWidth: 1)
+        )
     }
 }
 
